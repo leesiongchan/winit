@@ -209,6 +209,7 @@ declare_class!(
             trace_scope!("windowDidBecomeKey:");
             // TODO: center the cursor if the window had mouse grab when it
             // lost focus
+            self.view().reset_composition_context(true);
             self.queue_event(WindowEvent::Focused(true));
         }
 
@@ -222,6 +223,7 @@ declare_class!(
             // NSWindowDelegate, and as a result a tracked modifiers state can quite
             // easily fall out of synchrony with reality.  This requires us to emit
             // a synthetic ModifiersChanged event when we lose focus.
+            self.view().reset_composition_context(false);
             self.view().reset_modifiers();
 
             self.queue_event(WindowEvent::Focused(false));

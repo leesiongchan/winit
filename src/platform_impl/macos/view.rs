@@ -120,6 +120,9 @@ pub struct ViewState {
     phys_modifiers: RefCell<HashMap<Key, ModLocationMask>>,
     tracking_rect: Cell<Option<NSTrackingRectTag>>,
     ime_state: Cell<ImeState>,
+    composition_context: Cell<u64>,
+    composition_callback_context: Cell<Option<u64>>,
+    composition_status: Cell<crate::event::CompositionStatus>,
     input_source: RefCell<String>,
 
     /// True iff the application wants IME events.
@@ -295,6 +298,12 @@ declare_class!(
                 )
             };
 
+            self.report_composition(if string.is_empty() {
+                crate::event::CompositionStatus::Unknown
+            } else {
+                crate::event::CompositionStatus::Active
+            });
+
             // Update marked text.
             *self.ivars().marked_text.borrow_mut() = marked_text;
 
@@ -337,12 +346,18 @@ declare_class!(
         #[method(unmarkText)]
         fn unmark_text(&self) {
             trace_scope!("unmarkText");
+            let context_id = self.callback_context();
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
 
             let input_context = self.inputContext().expect("input context");
             input_context.discardMarkedText();
 
             self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+            self.report_composition_for(context_id, if self.ivars().composition_callback_context.get().is_some() {
+                crate::event::CompositionStatus::Idle
+            } else {
+                crate::event::CompositionStatus::Unknown
+            });
             if self.is_ime_enabled() {
                 // Leave the Preedit self.ivars()
                 self.ivars().ime_state.set(ImeState::Ground);
@@ -412,6 +427,7 @@ declare_class!(
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
+                self.report_composition(crate::event::CompositionStatus::Idle);
             }
         }
 
@@ -447,6 +463,7 @@ declare_class!(
                 if *prev_input_source != current_input_source && self.is_ime_enabled() {
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
+                    self.reset_composition_context(true);
                     self.ivars().ime_state.set(ImeState::Disabled);
                     self.queue_event(WindowEvent::Ime(Ime::Disabled));
                 }
@@ -465,7 +482,19 @@ declare_class!(
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_allowed.get() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                let previous_context = self.ivars().composition_callback_context
+                    .replace(Some(self.ivars().composition_context.get()));
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
+                // Pinyin cancels with an empty marked update. Explicitly discard that
+                // conversion on plain Escape rather than infer its end from emptiness.
+                if unsafe { event.keyCode() } == 53 && event_mods(&event).state().is_empty()
+                    && self.ivars().composition_status.get() == crate::event::CompositionStatus::Unknown
+                {
+                    if let Some(context) = self.inputContext() { context.discardMarkedText(); }
+                    *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    self.report_composition(crate::event::CompositionStatus::Idle);
+                }
+                self.ivars().composition_callback_context.set(previous_context);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -800,6 +829,9 @@ impl WinitView {
             phys_modifiers: Default::default(),
             tracking_rect: Default::default(),
             ime_state: Default::default(),
+            composition_context: Cell::new(0),
+            composition_callback_context: Cell::new(None),
+            composition_status: Cell::new(crate::event::CompositionStatus::Unknown),
             input_source: Default::default(),
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
@@ -877,10 +909,50 @@ impl WinitView {
         }
     }
 
+    fn callback_context(&self) -> u64 {
+        self.ivars().composition_callback_context.get()
+            .unwrap_or(self.ivars().composition_context.get())
+    }
+
+    fn report_composition(&self, status: crate::event::CompositionStatus) {
+        let status = if status == crate::event::CompositionStatus::Idle
+            && self.ivars().composition_callback_context.get().is_none()
+        {
+            crate::event::CompositionStatus::Unknown
+        } else { status };
+        self.report_composition_for(self.callback_context(), status);
+    }
+
+    fn report_composition_for(&self, context_id: u64, status: crate::event::CompositionStatus) {
+        tracing::debug!(target: "bulletnotes::composition", window_id = ?self.window().id(), context_id, ?status, "native lifecycle");
+        if context_id == self.ivars().composition_context.get() {
+            self.ivars().composition_status.set(status);
+        }
+        self.queue_event(WindowEvent::Ime(Ime::CompositionStatusChanged { context_id, status }));
+    }
+
+    pub(super) fn reset_composition_context(&self, establish_idle: bool) {
+        let old = self.ivars().composition_context.get();
+        let next = old.checked_add(1).expect("native input context generation exhausted");
+        self.ivars().composition_context.set(next);
+        self.report_composition_for(next, crate::event::CompositionStatus::Unknown);
+        let previous = self.ivars().composition_callback_context.replace(Some(old));
+        if let Some(context) = self.inputContext() { context.discardMarkedText(); }
+        self.ivars().composition_callback_context.set(previous);
+        *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+        self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+        if establish_idle {
+            self.report_composition_for(next, crate::event::CompositionStatus::Idle);
+        }
+    }
+
     pub(super) fn set_ime_allowed(&self, ime_allowed: bool) {
         if self.ivars().ime_allowed.get() == ime_allowed {
             return;
         }
+        // Explicitly discarding conversion in a key window establishes a fresh idle context,
+        // even when keyboard focus moves from the editor to application chrome.
+        self.reset_composition_context(ime_allowed || self.window().isKeyWindow());
         self.ivars().ime_allowed.set(ime_allowed);
         if self.ivars().ime_allowed.get() {
             return;
